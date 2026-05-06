@@ -57,17 +57,19 @@ enum Cmd {
     ///   `map`  — global map.md + ai/graph.json + ai/modules.md
     ///   (no arg / `kind`) — every kind whose manifest entry has `index.output`
     Index {
-        #[arg(value_enum, default_value_t = IndexTarget::Kind)]
+        #[arg(value_enum, default_value_t = IndexTarget::All)]
         target: IndexTarget,
     },
     /// List every known ID (debug aid).
     List,
 }
 
-#[derive(clap::ValueEnum, Clone, Copy)]
+#[derive(clap::ValueEnum, Debug, PartialEq, Eq, Clone, Copy)]
 enum IndexTarget {
+    /// Global doc map: `${KSSNI_DOC_ROOT}/map.md` + `ai/graph.json` + `ai/modules.md`.
     Map,
-    Kind,
+    /// Every kind whose manifest entry has `index.output`.
+    All,
 }
 
 // ---------------------------------------------------------------------------
@@ -79,15 +81,24 @@ struct ManifestFile {
     kinds: Vec<KindDef>,
 }
 
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DeclaredVia {
+    /// IDs are declared inside another doc's `provides:` list.
+    Provides,
+    /// File written by `kssni index`; never hand-edited.
+    Generated,
+}
+
 #[derive(Debug, Deserialize, Clone)]
 #[allow(dead_code)] // id_pattern + singleton are documented in kinds.md, surfaced via the manifest model for future use.
 struct KindDef {
     name: String,
     #[serde(default)]
     path_globs: Vec<String>,
-    /// "provides" or "generated"; absent means a normal file-backed kind.
+    /// `provides` or `generated`; absent means a normal file-backed kind.
     #[serde(default)]
-    declared_via: Option<String>,
+    declared_via: Option<DeclaredVia>,
     #[serde(default)]
     id_pattern: Option<String>,
     #[serde(default)]
@@ -373,6 +384,31 @@ fn build_graph(
                     rel.display(),
                     refs_block.id,
                     refs_block.kind
+                ));
+                continue;
+            }
+            // Index-doc invariants:
+            //   kind == "index" iff generated == true
+            //   indexes_kind.is_some() implies kind == "index"
+            // Per-kind indexes set `indexes_kind`; the global map.md / modules.md leave it unset.
+            let is_index_kind = refs_block.kind == "index";
+            let has_indexes_kind = refs_block.indexes_kind.is_some();
+            if is_index_kind != refs_block.generated {
+                errors.push(format!(
+                    "{} ({}): kind=`{}` and generated={} must agree (kind `index` requires generated: true and vice versa)",
+                    rel.display(),
+                    refs_block.id,
+                    refs_block.kind,
+                    refs_block.generated,
+                ));
+                continue;
+            }
+            if has_indexes_kind && !is_index_kind {
+                errors.push(format!(
+                    "{} ({}): indexes_kind set on non-index doc (kind=`{}`)",
+                    rel.display(),
+                    refs_block.id,
+                    refs_block.kind,
                 ));
                 continue;
             }
@@ -826,7 +862,7 @@ fn cmd_index(
 ) -> Result<ExitCode> {
     match target {
         IndexTarget::Map => write_map(root, doc_root, graph),
-        IndexTarget::Kind => write_per_kind_indexes(root, manifest, graph),
+        IndexTarget::All => write_per_kind_indexes(root, manifest, graph),
     }
 }
 
