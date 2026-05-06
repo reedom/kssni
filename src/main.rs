@@ -1,0 +1,1340 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use anyhow::{Context, Result, anyhow, bail};
+use clap::{Parser, Subcommand};
+use serde::Deserialize;
+use walkdir::WalkDir;
+
+const DEFAULT_DOC_ROOT: &str = "docs";
+
+const SKIP_DIRS: &[&str] = &[".git", "target", "node_modules"];
+
+#[derive(Parser)]
+#[command(
+    name = "kssni",
+    about = "Cross-reference graph tooling for Markdown specs and docs"
+)]
+struct Cli {
+    #[arg(long, value_name = "DIR", global = true)]
+    root: Option<PathBuf>,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Validate the doc graph (dangling refs, dup IDs, unknown kinds, missing modules).
+    Validate,
+    /// Print everything that depends on the given IDs (forward impact, transitive).
+    Impact {
+        ids: Vec<String>,
+        #[arg(long, default_value_t = u32::MAX)]
+        depth: u32,
+        /// Include `related:` edges (soft links). Default: hard edges only.
+        #[arg(long)]
+        include_related: bool,
+    },
+    /// Print everything the given IDs depend on (reverse, transitive).
+    Deps {
+        ids: Vec<String>,
+        #[arg(long, default_value_t = u32::MAX)]
+        depth: u32,
+        #[arg(long)]
+        include_related: bool,
+    },
+    /// Print one doc: front matter + immediate forward and reverse refs.
+    Show { id: String },
+    /// Given source files, print docs whose `modules:` cover them, plus impact closure.
+    Touched {
+        files: Vec<PathBuf>,
+        #[arg(long)]
+        no_closure: bool,
+    },
+    /// Regenerate index files. Targets:
+    ///   `map` — global map.md + ai/graph.json + ai/modules.md
+    ///   `all` (default) — every kind whose manifest entry has `index.output`
+    Index {
+        #[arg(value_enum, default_value_t = IndexTarget::All)]
+        target: IndexTarget,
+    },
+    /// List every known ID (debug aid).
+    List,
+}
+
+#[derive(clap::ValueEnum, Debug, PartialEq, Eq, Clone, Copy)]
+enum IndexTarget {
+    /// Global doc map: `${KSSNI_DOC_ROOT}/map.md` + `ai/graph.json` + `ai/modules.md`.
+    Map,
+    /// Every kind whose manifest entry has `index.output`.
+    All,
+}
+
+// ---------------------------------------------------------------------------
+// Newtypes
+// ---------------------------------------------------------------------------
+
+/// Identifier of a doc node in the cross-reference graph.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, serde::Serialize)]
+#[serde(transparent)]
+struct DocId(String);
+
+impl DocId {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for DocId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for DocId {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for DocId {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl std::borrow::Borrow<str> for DocId {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Identifier of a doc kind (the `kind:` field in front matter).
+/// The literal `"index"` denotes a generated INDEX doc.
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, serde::Serialize)]
+#[serde(transparent)]
+struct Kind(String);
+
+impl Kind {
+    const INDEX_LITERAL: &'static str = "index";
+
+    #[allow(dead_code)]
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn is_index(&self) -> bool {
+        self.0 == Self::INDEX_LITERAL
+    }
+}
+
+impl std::fmt::Display for Kind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for Kind {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl From<&str> for Kind {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl std::borrow::Borrow<str> for Kind {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kind manifest (loaded from ${KSSNI_DOC_ROOT}/kinds.md)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ManifestFile {
+    kinds: Vec<KindDef>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DeclaredVia {
+    /// IDs are declared inside another doc's `provides:` list.
+    Provides,
+    /// File written by `kssni index`; never hand-edited.
+    Generated,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[allow(dead_code)] // `id_pattern` and `singleton` are informational manifest fields.
+struct KindDef {
+    name: Kind,
+    #[serde(default)]
+    path_globs: Vec<String>,
+    /// `provides` for kinds declared inside another doc's `provides:`,
+    /// `generated` for kinds written by `kssni index`. Absent for
+    /// hand-authored, file-backed kinds.
+    #[serde(default)]
+    declared_via: Option<DeclaredVia>,
+    #[serde(default)]
+    id_pattern: Option<String>,
+    #[serde(default)]
+    singleton: bool,
+    #[serde(default)]
+    index: Option<KindIndex>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct KindIndex {
+    output: String,
+    #[serde(default)]
+    group_by: Option<String>,
+}
+
+struct Manifest {
+    kinds: BTreeMap<Kind, KindDef>,
+}
+
+impl Manifest {
+    fn load(root: &Path, doc_root: &Path) -> Result<Self> {
+        let path = root.join(doc_root).join("kinds.md");
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read kind manifest at {}", path.display()))?;
+        let yaml = extract_fenced_yaml(&raw)
+            .ok_or_else(|| anyhow!("{}: no ```yaml ...``` fenced block found", path.display()))?;
+        let parsed: ManifestFile = serde_yaml_ng::from_str(yaml)
+            .with_context(|| format!("parse kind manifest at {}", path.display()))?;
+        let mut kinds = BTreeMap::new();
+        for k in parsed.kinds {
+            if kinds.contains_key(&k.name) {
+                bail!("{}: duplicate kind `{}`", path.display(), k.name);
+            }
+            if k.path_globs.is_empty() && k.declared_via.is_none() {
+                bail!(
+                    "{}: kind `{}` has neither `path_globs` nor `declared_via`",
+                    path.display(),
+                    k.name
+                );
+            }
+            kinds.insert(k.name.clone(), k);
+        }
+        Ok(Self { kinds })
+    }
+
+    fn knows(&self, kind: &Kind) -> bool {
+        self.kinds.contains_key(kind)
+    }
+}
+
+/// Returns the body of the first ```yaml or ```yml fenced block in `content`.
+fn extract_fenced_yaml(content: &str) -> Option<&str> {
+    let mut byte_start: Option<usize> = None;
+    let mut byte_end: Option<usize> = None;
+    let mut cursor: usize = 0;
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\n', '\r']);
+        if byte_start.is_none() {
+            if trimmed == "```yaml" || trimmed == "```yml" {
+                byte_start = Some(cursor + line.len());
+            }
+        } else if trimmed == "```" {
+            byte_end = Some(cursor);
+            break;
+        }
+        cursor += line.len();
+    }
+    Some(&content[byte_start?..byte_end?])
+}
+
+// ---------------------------------------------------------------------------
+// Front matter + doc model
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct FrontMatter {
+    #[serde(default)]
+    refs: Option<RefsBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefsBlock {
+    id: DocId,
+    kind: Kind,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    spec: Option<String>,
+    #[serde(default)]
+    provides: Vec<DocId>,
+    #[serde(default)]
+    implements: Vec<DocId>,
+    #[serde(default)]
+    depends_on: Vec<DocId>,
+    #[serde(default)]
+    related: Vec<DocId>,
+    #[serde(default)]
+    modules: Vec<String>,
+    #[serde(default)]
+    generated: bool,
+    /// For `kind: index` — name of the kind being indexed.
+    #[serde(default)]
+    indexes_kind: Option<Kind>,
+}
+
+#[derive(Debug, Clone)]
+struct Doc {
+    id: DocId,
+    class: DocClass,
+    title: Option<String>,
+    spec: Option<String>,
+    rel_path: PathBuf,
+    provides: Vec<DocId>,
+    implements: Vec<DocId>,
+    depends_on: Vec<DocId>,
+    related: Vec<DocId>,
+    modules: Vec<String>,
+}
+
+/// Classifies a doc as either user-authored or `kssni`-generated.
+#[derive(Debug, Clone)]
+enum DocClass {
+    /// Hand-authored doc with the given kind. The kind is never `"index"`.
+    Regular(Kind),
+    /// Generated INDEX doc with `kind: index` and `generated: true`.
+    Index(IndexFlavor),
+}
+
+#[derive(Debug, Clone)]
+enum IndexFlavor {
+    /// Global INDEX (e.g. `map.md`, `ai/modules.md`); no `indexes_kind`.
+    Global,
+    /// Per-kind INDEX pointing at the named kind.
+    PerKind(Kind),
+}
+
+impl Doc {
+    fn kind(&self) -> Kind {
+        match &self.class {
+            DocClass::Regular(k) => k.clone(),
+            DocClass::Index(_) => Kind::from(Kind::INDEX_LITERAL),
+        }
+    }
+
+    fn generated(&self) -> bool {
+        matches!(self.class, DocClass::Index(_))
+    }
+
+    fn indexes_kind(&self) -> Option<&Kind> {
+        match &self.class {
+            DocClass::Index(IndexFlavor::PerKind(k)) => Some(k),
+            _ => None,
+        }
+    }
+}
+
+type EdgeMap = HashMap<DocId, BTreeSet<DocId>>;
+
+struct Graph {
+    docs: BTreeMap<DocId, Doc>,
+    /// Maps every known id (including `provides:` aliases) to the id of the
+    /// owning doc in `docs`. A doc's primary id maps to itself.
+    id_to_doc: HashMap<DocId, DocId>,
+    forward: EdgeMap,
+    reverse: EdgeMap,
+    related_forward: EdgeMap,
+    related_reverse: EdgeMap,
+}
+
+// ---------------------------------------------------------------------------
+// Entry
+// ---------------------------------------------------------------------------
+
+fn main() -> ExitCode {
+    match real_main() {
+        Ok(rc) => rc,
+        Err(e) => {
+            eprintln!("error: {e:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn real_main() -> Result<ExitCode> {
+    let cli = Cli::parse();
+    let root = match cli.root.clone() {
+        Some(p) => p,
+        None => std::env::current_dir().context("resolve current working directory")?,
+    };
+    let doc_root = match std::env::var("KSSNI_DOC_ROOT") {
+        Ok(s) => PathBuf::from(s),
+        Err(std::env::VarError::NotPresent) => PathBuf::from(DEFAULT_DOC_ROOT),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("KSSNI_DOC_ROOT is not valid UTF-8");
+        }
+    };
+    run(&cli, &root, &doc_root)
+}
+
+fn run(cli: &Cli, root: &Path, doc_root: &Path) -> Result<ExitCode> {
+    let manifest = Manifest::load(root, doc_root)?;
+    let (graph, parse_errors) = build_graph(root, doc_root, &manifest)?;
+    if !matches!(cli.cmd, Cmd::Validate) && !parse_errors.is_empty() {
+        eprintln!(
+            "warning: {} parse error(s); run `kssni validate` for details",
+            parse_errors.len()
+        );
+    }
+    match &cli.cmd {
+        Cmd::Validate => cmd_validate(root, &manifest, &graph, &parse_errors),
+        Cmd::Impact {
+            ids,
+            depth,
+            include_related,
+        } => cmd_traverse(&graph, ids, *depth, Direction::Forward, *include_related),
+        Cmd::Deps {
+            ids,
+            depth,
+            include_related,
+        } => cmd_traverse(&graph, ids, *depth, Direction::Reverse, *include_related),
+        Cmd::Show { id } => cmd_show(&graph, id),
+        Cmd::Touched { files, no_closure } => cmd_touched(root, &graph, files, *no_closure),
+        Cmd::Index { target } => cmd_index(root, doc_root, &manifest, &graph, *target),
+        Cmd::List => cmd_list(&graph),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scan & graph build
+// ---------------------------------------------------------------------------
+
+fn build_graph(
+    root: &Path,
+    doc_root: &Path,
+    manifest: &Manifest,
+) -> Result<(Graph, Vec<String>)> {
+    let mut docs: BTreeMap<DocId, Doc> = BTreeMap::new();
+    let mut id_to_doc: HashMap<DocId, DocId> = HashMap::new();
+    let mut errors: Vec<String> = Vec::new();
+
+    let scan_roots = derive_scan_roots(manifest, doc_root);
+    let mut visited_files: BTreeSet<PathBuf> = BTreeSet::new();
+    for rel in scan_roots {
+        let scan = root.join(&rel);
+        match fs::metadata(&scan) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                errors.push(format!("scan root {}: {e}", scan.display()));
+                continue;
+            }
+        }
+        let walker = WalkDir::new(&scan).into_iter().filter_entry(|e| {
+            !e.file_name()
+                .to_str()
+                .map(|n| SKIP_DIRS.contains(&n))
+                .unwrap_or(false)
+        });
+        for entry in walker {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    errors.push(format!("walk {}: {e}", scan.display()));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(rel_path) = path.strip_prefix(root) else {
+                errors.push(format!(
+                    "path {} escaped scan root {}",
+                    path.display(),
+                    root.display()
+                ));
+                continue;
+            };
+            let rel = rel_path.to_path_buf();
+            if !visited_files.insert(rel.clone()) {
+                continue;
+            }
+
+            let raw = match fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(e) => {
+                    errors.push(format!("{}: read failed: {e}", rel.display()));
+                    continue;
+                }
+            };
+            let yaml = match extract_frontmatter(&raw) {
+                Some(y) => y,
+                None => {
+                    if raw.starts_with("---\n") || raw.starts_with("---\r\n") {
+                        errors.push(format!(
+                            "{}: malformed front matter (missing closing `---`)",
+                            rel.display()
+                        ));
+                    }
+                    continue;
+                }
+            };
+            let fm: FrontMatter = match serde_yaml_ng::from_str(yaml) {
+                Ok(v) => v,
+                Err(e) => {
+                    errors.push(format!("{}: front matter parse error: {e}", rel.display()));
+                    continue;
+                }
+            };
+            let Some(refs_block) = fm.refs else {
+                continue;
+            };
+            if !manifest.knows(&refs_block.kind) {
+                errors.push(format!(
+                    "{} ({}): unknown kind `{}` (not declared in kinds.md)",
+                    rel.display(),
+                    refs_block.id,
+                    refs_block.kind
+                ));
+                continue;
+            }
+            let class = match (
+                refs_block.kind.is_index(),
+                refs_block.generated,
+                refs_block.indexes_kind.clone(),
+            ) {
+                (false, false, None) => DocClass::Regular(refs_block.kind.clone()),
+                (true, true, None) => DocClass::Index(IndexFlavor::Global),
+                (true, true, Some(k)) => DocClass::Index(IndexFlavor::PerKind(k)),
+                (true, false, _) | (false, true, _) => {
+                    errors.push(format!(
+                        "{} ({}): kind=`{}` and generated={} must agree (kind `index` requires generated: true and vice versa)",
+                        rel.display(),
+                        refs_block.id,
+                        refs_block.kind,
+                        refs_block.generated,
+                    ));
+                    continue;
+                }
+                (false, false, Some(_)) => {
+                    errors.push(format!(
+                        "{} ({}): indexes_kind set on non-index doc (kind=`{}`)",
+                        rel.display(),
+                        refs_block.id,
+                        refs_block.kind,
+                    ));
+                    continue;
+                }
+            };
+            let doc = Doc {
+                id: refs_block.id.clone(),
+                class,
+                title: refs_block.title,
+                spec: refs_block.spec,
+                rel_path: rel.clone(),
+                provides: refs_block.provides,
+                implements: refs_block.implements,
+                depends_on: refs_block.depends_on,
+                related: refs_block.related,
+                modules: refs_block.modules,
+            };
+            if let Some(prev) = docs.get(&doc.id) {
+                errors.push(format!(
+                    "duplicate id `{}` in {} and {}",
+                    doc.id,
+                    prev.rel_path.display(),
+                    rel.display()
+                ));
+                continue;
+            }
+            let mut conflict = false;
+            for pid in &doc.provides {
+                if let Some(owner) = id_to_doc.get(pid) {
+                    errors.push(format!(
+                        "duplicate id `{}` provided by both {} and {}",
+                        pid,
+                        docs.get(owner).map(|d| d.rel_path.display().to_string()).unwrap_or_default(),
+                        rel.display()
+                    ));
+                    conflict = true;
+                }
+            }
+            if conflict {
+                continue;
+            }
+            for pid in &doc.provides {
+                id_to_doc.insert(pid.clone(), doc.id.clone());
+            }
+            id_to_doc.insert(doc.id.clone(), doc.id.clone());
+            docs.insert(doc.id.clone(), doc);
+        }
+    }
+
+    let (forward, reverse, related_forward, related_reverse) =
+        build_edges(&docs, &id_to_doc, &mut errors);
+    Ok((
+        Graph {
+            docs,
+            id_to_doc,
+            forward,
+            reverse,
+            related_forward,
+            related_reverse,
+        },
+        errors,
+    ))
+}
+
+/// Returns the directories to walk: each `path_glob` reduced to its longest
+/// non-glob prefix, plus `doc_root`.
+fn derive_scan_roots(manifest: &Manifest, doc_root: &Path) -> BTreeSet<PathBuf> {
+    let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
+    roots.insert(doc_root.to_path_buf());
+    for kind in manifest.kinds.values() {
+        for glob in &kind.path_globs {
+            roots.insert(glob_root(glob));
+        }
+    }
+    roots
+}
+
+fn glob_root(glob: &str) -> PathBuf {
+    let meta_idx = glob.find(['*', '?', '[']);
+    match meta_idx {
+        None => Path::new(glob)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+        Some(idx) => {
+            let prefix = &glob[..idx];
+            let trimmed = prefix.rsplit_once('/').map(|(a, _)| a).unwrap_or("");
+            if trimmed.is_empty() {
+                PathBuf::from(".")
+            } else {
+                PathBuf::from(trimmed)
+            }
+        }
+    }
+}
+
+fn extract_frontmatter(raw: &str) -> Option<&str> {
+    let body = raw
+        .strip_prefix("---\n")
+        .or_else(|| raw.strip_prefix("---\r\n"))?;
+    let end = body.find("\n---\n").or_else(|| body.find("\n---\r\n"))?;
+    Some(&body[..end])
+}
+
+fn build_edges(
+    docs: &BTreeMap<DocId, Doc>,
+    id_to_doc: &HashMap<DocId, DocId>,
+    errors: &mut Vec<String>,
+) -> (EdgeMap, EdgeMap, EdgeMap, EdgeMap) {
+    let mut forward: EdgeMap = HashMap::new();
+    let mut reverse: EdgeMap = HashMap::new();
+    let mut related_forward: EdgeMap = HashMap::new();
+    let mut related_reverse: EdgeMap = HashMap::new();
+    for doc in docs.values() {
+        for target in &doc.related {
+            if !id_to_doc.contains_key(target) {
+                errors.push(format!(
+                    "{} ({}): dangling reference `{}` (related)",
+                    doc.rel_path.display(),
+                    doc.id,
+                    target
+                ));
+                continue;
+            }
+            related_forward
+                .entry(doc.id.clone())
+                .or_default()
+                .insert(target.clone());
+            related_reverse
+                .entry(target.clone())
+                .or_default()
+                .insert(doc.id.clone());
+        }
+        let edges = doc.implements.iter().chain(doc.depends_on.iter());
+        for target in edges {
+            if !id_to_doc.contains_key(target) {
+                errors.push(format!(
+                    "{} ({}): dangling reference `{}`",
+                    doc.rel_path.display(),
+                    doc.id,
+                    target
+                ));
+                continue;
+            }
+            forward.entry(doc.id.clone()).or_default().insert(target.clone());
+            reverse.entry(target.clone()).or_default().insert(doc.id.clone());
+        }
+    }
+    (forward, reverse, related_forward, related_reverse)
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+fn cmd_validate(
+    root: &Path,
+    manifest: &Manifest,
+    graph: &Graph,
+    parse_errors: &[String],
+) -> Result<ExitCode> {
+    let mut errors: Vec<String> = parse_errors.to_vec();
+    for doc in graph.docs.values() {
+        for m in &doc.modules {
+            let abs = root.join(m.trim_end_matches('/'));
+            if !abs.exists() {
+                errors.push(format!(
+                    "{} ({}): module path `{}` does not exist",
+                    doc.rel_path.display(),
+                    doc.id,
+                    m
+                ));
+            }
+        }
+    }
+
+    // Every file matched by a kind's `path_globs` must have a `refs:` block.
+    let in_graph: BTreeSet<PathBuf> = graph
+        .docs
+        .values()
+        .map(|d| d.rel_path.clone())
+        .collect();
+    for kind in manifest.kinds.values() {
+        for pat in &kind.path_globs {
+            let absolute = format!("{}/{}", root.display(), pat);
+            let matches = match glob::glob(&absolute) {
+                Ok(m) => m,
+                Err(e) => {
+                    errors.push(format!("kind `{}`: bad glob `{}`: {e}", kind.name, pat));
+                    continue;
+                }
+            };
+            for entry in matches {
+                let path = match entry {
+                    Ok(p) => p,
+                    Err(e) => {
+                        errors.push(format!("kind `{}` glob `{}`: {e}", kind.name, pat));
+                        continue;
+                    }
+                };
+                let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                if !in_graph.contains(&rel) {
+                    errors.push(format!(
+                        "{}: matches kind `{}` glob `{}` but has no `refs:` block",
+                        rel.display(),
+                        kind.name,
+                        pat
+                    ));
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        println!("OK ({} docs)", graph.docs.len());
+        Ok(ExitCode::SUCCESS)
+    } else {
+        for e in &errors {
+            eprintln!("- {e}");
+        }
+        eprintln!("\n{} error(s)", errors.len());
+        Ok(ExitCode::from(1))
+    }
+}
+
+#[derive(Copy, Clone)]
+enum Direction {
+    Forward,
+    Reverse,
+}
+
+fn cmd_traverse(
+    graph: &Graph,
+    ids: &[String],
+    depth: u32,
+    dir: Direction,
+    include_related: bool,
+) -> Result<ExitCode> {
+    if ids.is_empty() {
+        bail!("at least one id is required");
+    }
+    let mut missing: Vec<&str> = Vec::new();
+    let mut seeds: Vec<DocId> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if graph.id_to_doc.contains_key(id.as_str()) {
+            seeds.push(DocId::from(id.as_str()));
+        } else {
+            missing.push(id.as_str());
+        }
+    }
+    if !missing.is_empty() {
+        bail!("unknown id(s): {}", missing.join(", "));
+    }
+    let (hard, soft) = match dir {
+        Direction::Forward => (&graph.reverse, &graph.related_reverse),
+        Direction::Reverse => (&graph.forward, &graph.related_forward),
+    };
+    let header = match dir {
+        Direction::Forward => "Affected by changes to:",
+        Direction::Reverse => "Dependencies of:",
+    };
+    println!("{header}");
+    for id in ids {
+        println!("  {id}");
+    }
+    if include_related {
+        println!("(including soft `related:` edges)");
+    }
+    println!();
+
+    let mut seen: BTreeSet<DocId> = seeds.iter().cloned().collect();
+    let mut frontier: VecDeque<(DocId, u32)> =
+        seeds.iter().map(|id| (id.clone(), 0)).collect();
+    let mut layered: BTreeMap<u32, BTreeSet<DocId>> = BTreeMap::new();
+
+    while let Some((cur, d)) = frontier.pop_front() {
+        if d == depth {
+            continue;
+        }
+        let mut neighbors: BTreeSet<DocId> = BTreeSet::new();
+        if let Some(s) = hard.get(&cur) {
+            neighbors.extend(s.iter().cloned());
+        }
+        if include_related {
+            if let Some(s) = soft.get(&cur) {
+                neighbors.extend(s.iter().cloned());
+            }
+        }
+        for n in neighbors {
+            if seen.insert(n.clone()) {
+                layered.entry(d + 1).or_default().insert(n.clone());
+                frontier.push_back((n.clone(), d + 1));
+            }
+        }
+    }
+
+    if layered.is_empty() {
+        println!("(none)");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for (d, set) in &layered {
+        println!("depth {d}:");
+        for id in set {
+            print_id_line(graph, id.as_str(), "  ");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_show(graph: &Graph, id: &str) -> Result<ExitCode> {
+    let doc_id = graph
+        .id_to_doc
+        .get(id)
+        .ok_or_else(|| anyhow!("unknown id `{id}`"))?;
+    let doc = graph
+        .docs
+        .get(doc_id)
+        .ok_or_else(|| anyhow!("internal: doc `{doc_id}` missing"))?;
+
+    println!("id:       {}", doc.id);
+    if doc.id.as_str() != id {
+        println!("queried:  {id}  (provided by {})", doc.id);
+    }
+    println!("kind:     {}", doc.kind());
+    if doc.generated() {
+        println!("generated: true");
+        if let Some(k) = doc.indexes_kind() {
+            println!("indexes_kind: {k}");
+        }
+    }
+    if let Some(s) = &doc.spec {
+        println!("spec:     {s}");
+    }
+    if let Some(t) = &doc.title {
+        println!("title:    {t}");
+    }
+    println!("path:     {}", doc.rel_path.display());
+
+    print_list("provides:", &doc.provides);
+    print_list("implements:", &doc.implements);
+    print_list("depends_on:", &doc.depends_on);
+    print_list("related:", &doc.related);
+    print_list("modules:", &doc.modules);
+
+    println!();
+    println!("Direct impact (hard, who depends on this doc):");
+    if let Some(rev) = graph.reverse.get(&doc.id) {
+        for r in rev {
+            print_id_line(graph, r.as_str(), "  ");
+        }
+    } else {
+        println!("  (none)");
+    }
+    println!();
+    println!("Soft mentions (related: from other docs):");
+    if let Some(soft) = graph.related_reverse.get(&doc.id) {
+        for r in soft {
+            print_id_line(graph, r.as_str(), "  ");
+        }
+    } else {
+        println!("  (none)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_touched(
+    root: &Path,
+    graph: &Graph,
+    files: &[PathBuf],
+    no_closure: bool,
+) -> Result<ExitCode> {
+    if files.is_empty() {
+        bail!("at least one file is required");
+    }
+    let mut rel_files: Vec<String> = Vec::new();
+    for f in files {
+        let abs = if f.is_absolute() {
+            f.clone()
+        } else {
+            root.join(f)
+        };
+        let rel = abs.strip_prefix(root).unwrap_or(f).to_string_lossy().to_string();
+        rel_files.push(normalize_separators(&rel));
+    }
+
+    let mut hits: BTreeSet<DocId> = BTreeSet::new();
+    for doc in graph.docs.values() {
+        for m in &doc.modules {
+            let pat = normalize_separators(m);
+            for f in &rel_files {
+                if module_covers(&pat, f) {
+                    hits.insert(doc.id.clone());
+                }
+            }
+        }
+    }
+
+    println!("Files:");
+    for f in &rel_files {
+        println!("  {f}");
+    }
+    println!();
+    if hits.is_empty() {
+        println!("No docs claim these files in `modules:`.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("Docs of record (modules: covers these files):");
+    for id in &hits {
+        print_id_line(graph, id.as_str(), "  ");
+    }
+
+    if no_closure {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let mut seen = hits.clone();
+    let mut frontier: VecDeque<DocId> = hits.iter().cloned().collect();
+    let mut indirect: BTreeSet<DocId> = BTreeSet::new();
+    while let Some(cur) = frontier.pop_front() {
+        if let Some(rev) = graph.reverse.get(&cur) {
+            for n in rev {
+                if seen.insert(n.clone()) {
+                    indirect.insert(n.clone());
+                    frontier.push_back(n.clone());
+                }
+            }
+        }
+    }
+    if indirect.is_empty() {
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!();
+    println!("Transitively affected:");
+    for id in &indirect {
+        print_id_line(graph, id.as_str(), "  ");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn module_covers(pattern: &str, file: &str) -> bool {
+    if let Some(prefix) = pattern.strip_suffix('/') {
+        // "a/b/" matches any file *under* a/b, not a/b itself.
+        file.starts_with(prefix) && file[prefix.len()..].starts_with('/')
+    } else {
+        file == pattern
+    }
+}
+
+/// Replaces every `\` with `/`.
+fn normalize_separators(s: &str) -> String {
+    if s.contains('\\') {
+        s.replace('\\', "/")
+    } else {
+        s.to_owned()
+    }
+}
+
+fn cmd_index(
+    root: &Path,
+    doc_root: &Path,
+    manifest: &Manifest,
+    graph: &Graph,
+    target: IndexTarget,
+) -> Result<ExitCode> {
+    match target {
+        IndexTarget::Map => write_map(root, doc_root, graph),
+        IndexTarget::All => write_per_kind_indexes(root, manifest, graph),
+    }
+}
+
+fn write_map(root: &Path, doc_root: &Path, graph: &Graph) -> Result<ExitCode> {
+    let map_path = root.join(doc_root).join("map.md");
+    let json_path = root.join(doc_root).join("ai/graph.json");
+    let modules_path = root.join(doc_root).join("ai/modules.md");
+
+    if let Some(parent) = json_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+
+    // 1. Human-readable map.md
+    let mut by_kind: BTreeMap<Kind, Vec<&Doc>> = BTreeMap::new();
+    for d in graph.docs.values() {
+        if d.generated() {
+            continue;
+        }
+        by_kind.entry(d.kind()).or_default().push(d);
+    }
+    let mut map = String::new();
+    map.push_str("---\nrefs:\n  id: index:map\n  kind: index\n  generated: true\n  title: \"Doc Map (all kinds)\"\n---\n\n");
+    map.push_str("# Doc Map\n\n");
+    map.push_str("Generated by `kssni index map`. Do not edit by hand.\n");
+    map.push_str("All docs across kinds. For per-kind indexes see the per-kind INDEX files; for AI consumption see [ai/graph.json](ai/graph.json).\n\n");
+    for (kind, docs) in &by_kind {
+        map.push_str(&format!("## {} ({})\n\n", kind, docs.len()));
+        map.push_str("| ID | Title | Spec | Path |\n|---|---|---|---|\n");
+        for d in docs {
+            map.push_str(&format!(
+                "| `{}` | {} | {} | [{}]({}) |\n",
+                d.id,
+                d.title.clone().unwrap_or_default(),
+                d.spec.clone().unwrap_or_default(),
+                d.rel_path.display(),
+                doc_link(doc_root, &d.rel_path),
+            ));
+        }
+        map.push('\n');
+    }
+    fs::write(&map_path, map).with_context(|| format!("write {}", map_path.display()))?;
+    println!("wrote {}", map_path.display());
+
+    // 2. AI graph.json
+    let json = build_graph_json(graph)?;
+    fs::write(&json_path, json).with_context(|| format!("write {}", json_path.display()))?;
+    println!("wrote {}", json_path.display());
+
+    // 3. ai/modules.md
+    let mut by_module: BTreeMap<&String, BTreeSet<&DocId>> = BTreeMap::new();
+    for d in graph.docs.values() {
+        for m in &d.modules {
+            by_module.entry(m).or_default().insert(&d.id);
+        }
+    }
+    let mut mm = String::new();
+    mm.push_str("---\nrefs:\n  id: index:modules\n  kind: index\n  generated: true\n  title: \"Source -> Doc Map\"\n---\n\n");
+    mm.push_str("# Source -> Doc Map\n\n");
+    mm.push_str("Generated by `kssni index map`. Do not edit by hand.\n\n");
+    mm.push_str("| Source path | Docs of record |\n|---|---|\n");
+    for (m, ids) in &by_module {
+        let cell: Vec<String> = ids.iter().map(|i| format!("`{i}`")).collect();
+        mm.push_str(&format!("| `{}` | {} |\n", m, cell.join(", ")));
+    }
+    fs::write(&modules_path, mm)
+        .with_context(|| format!("write {}", modules_path.display()))?;
+    println!("wrote {}", modules_path.display());
+
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Returns `rel_path` rewritten relative to `doc_root` (where `map.md` lives).
+/// Paths under `doc_root` are stripped of that prefix; paths outside it are
+/// prefixed with one `../` per `doc_root` component.
+fn doc_link(doc_root: &Path, rel_path: &Path) -> String {
+    if let Ok(stripped) = rel_path.strip_prefix(doc_root) {
+        return stripped.display().to_string();
+    }
+    let depth = doc_root.components().count();
+    let mut up = String::new();
+    for _ in 0..depth {
+        up.push_str("../");
+    }
+    format!("{}{}", up, rel_path.display())
+}
+
+#[derive(serde::Serialize)]
+struct JsonGraph<'a> {
+    schema_version: u32,
+    docs: Vec<JsonDoc<'a>>,
+    modules: BTreeMap<&'a String, BTreeSet<&'a DocId>>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonDoc<'a> {
+    id: &'a DocId,
+    kind: Kind,
+    path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec: Option<&'a String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    generated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    indexes_kind: Option<&'a Kind>,
+    provides: &'a [DocId],
+    implements: &'a [DocId],
+    depends_on: &'a [DocId],
+    related: &'a [DocId],
+    modules: &'a [String],
+}
+
+fn build_graph_json(graph: &Graph) -> Result<String> {
+    let docs: Vec<JsonDoc> = graph
+        .docs
+        .values()
+        .map(|d| JsonDoc {
+            id: &d.id,
+            kind: d.kind(),
+            path: d.rel_path.display().to_string(),
+            title: d.title.as_ref(),
+            spec: d.spec.as_ref(),
+            generated: d.generated(),
+            indexes_kind: d.indexes_kind(),
+            provides: &d.provides,
+            implements: &d.implements,
+            depends_on: &d.depends_on,
+            related: &d.related,
+            modules: &d.modules,
+        })
+        .collect();
+    let mut modules: BTreeMap<&String, BTreeSet<&DocId>> = BTreeMap::new();
+    for d in graph.docs.values() {
+        for m in &d.modules {
+            modules.entry(m).or_default().insert(&d.id);
+        }
+    }
+    let payload = JsonGraph {
+        schema_version: 1,
+        docs,
+        modules,
+    };
+    let mut s = serde_json::to_string_pretty(&payload).context("serialize graph.json")?;
+    s.push('\n');
+    Ok(s)
+}
+
+fn write_per_kind_indexes(root: &Path, manifest: &Manifest, graph: &Graph) -> Result<ExitCode> {
+    let mut wrote = 0u32;
+    for kind in manifest.kinds.values() {
+        let Some(idx) = &kind.index else {
+            continue;
+        };
+        let mut docs: Vec<&Doc> = graph
+            .docs
+            .values()
+            .filter(|d| matches!(&d.class, DocClass::Regular(k) if *k == kind.name))
+            .collect();
+        docs.sort_by(|a, b| a.id.cmp(&b.id));
+
+        let title = format!("{} Index", kind.name);
+        let mut out = String::new();
+        out.push_str("---\nrefs:\n");
+        out.push_str(&format!("  id: index:{}\n", kind.name));
+        out.push_str("  kind: index\n");
+        out.push_str(&format!("  indexes_kind: {}\n", kind.name));
+        out.push_str("  generated: true\n");
+        out.push_str(&format!("  title: \"{title}\"\n"));
+        out.push_str("---\n\n");
+        out.push_str(&format!("# {title}\n\n"));
+        out.push_str(&format!(
+            "Generated by `kssni index`. Do not edit by hand. Lists every `{}` doc in this repository.\n\n",
+            kind.name
+        ));
+
+        let group_by = idx.group_by.as_deref();
+        if group_by == Some("spec") {
+            let mut by_spec: BTreeMap<String, Vec<&Doc>> = BTreeMap::new();
+            for d in &docs {
+                by_spec
+                    .entry(d.spec.clone().unwrap_or_else(|| "(unspec'd)".into()))
+                    .or_default()
+                    .push(d);
+            }
+            for (spec, ds) in &by_spec {
+                out.push_str(&format!("## {spec}\n\n"));
+                emit_kind_table(&mut out, ds);
+            }
+        } else {
+            emit_kind_table(&mut out, &docs);
+        }
+
+        let target = root.join(&idx.output);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        fs::write(&target, out).with_context(|| format!("write {}", target.display()))?;
+        println!("wrote {}", target.display());
+        wrote += 1;
+    }
+    if wrote == 0 {
+        println!("(no kinds with `index.output` configured)");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn emit_kind_table(out: &mut String, docs: &[&Doc]) {
+    out.push_str("| ID | Title | Implements | Depends on |\n|---|---|---|---|\n");
+    for d in docs {
+        out.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            d.id,
+            d.title.clone().unwrap_or_default(),
+            d.implements.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", "),
+            d.depends_on.iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", "),
+        ));
+    }
+    out.push('\n');
+}
+
+fn cmd_list(graph: &Graph) -> Result<ExitCode> {
+    let mut ids: Vec<&DocId> = graph.id_to_doc.keys().collect();
+    ids.sort();
+    for id in ids {
+        let Some(doc_id) = graph.id_to_doc.get(id) else {
+            continue;
+        };
+        let Some(doc) = graph.docs.get(doc_id) else {
+            eprintln!("warning: id `{id}` resolves to missing doc `{doc_id}`");
+            continue;
+        };
+        println!("{:<40} {:<14} {}", id, doc.kind(), doc.rel_path.display());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn print_list<T: std::fmt::Display>(label: &str, xs: &[T]) {
+    if xs.is_empty() {
+        return;
+    }
+    println!("{label}");
+    for x in xs {
+        println!("  - {x}");
+    }
+}
+
+fn print_id_line(graph: &Graph, id: &str, indent: &str) {
+    if let Some(doc_id) = graph.id_to_doc.get(id) {
+        if let Some(doc) = graph.docs.get(doc_id) {
+            let title = doc.title.as_deref().unwrap_or("");
+            println!("{indent}{id:<40} {title}");
+            return;
+        }
+    }
+    println!("{indent}{id}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_covers_exact() {
+        assert!(module_covers("a/b.rs", "a/b.rs"));
+        assert!(!module_covers("a/b.rs", "a/c.rs"));
+    }
+
+    #[test]
+    fn module_covers_dir_prefix() {
+        assert!(module_covers("a/b/", "a/b/c.rs"));
+        assert!(module_covers("a/b/", "a/b/d/e.rs"));
+        assert!(!module_covers("a/b/", "a/bc/x.rs"));
+        assert!(!module_covers("a/b/", "a/b"));
+    }
+
+    #[test]
+    fn normalize_separators_passthrough_for_unix() {
+        assert_eq!(normalize_separators("a/b/c.rs"), "a/b/c.rs");
+        assert_eq!(normalize_separators(""), "");
+    }
+
+    #[test]
+    fn normalize_separators_rewrites_windows() {
+        assert_eq!(normalize_separators("a\\b\\c.rs"), "a/b/c.rs");
+        assert_eq!(normalize_separators("a/b\\c.rs"), "a/b/c.rs");
+    }
+
+    #[test]
+    fn module_covers_after_normalization() {
+        let pat = normalize_separators("src\\auth\\");
+        let file = normalize_separators("src\\auth\\session.rs");
+        assert!(module_covers(&pat, &file));
+    }
+
+    #[test]
+    fn fenced_yaml_extracted() {
+        let content = "before\n```yaml\nfoo: 1\nbar: [x]\n```\nafter\n";
+        let yaml = extract_fenced_yaml(content).unwrap();
+        assert_eq!(yaml, "foo: 1\nbar: [x]\n");
+    }
+
+    #[test]
+    fn frontmatter_extracted() {
+        let content = "---\na: 1\n---\nbody\n";
+        assert_eq!(extract_frontmatter(content).unwrap(), "a: 1");
+    }
+
+    #[test]
+    fn frontmatter_absent() {
+        assert!(extract_frontmatter("# title only\n").is_none());
+    }
+
+    #[test]
+    fn glob_root_literal_path() {
+        assert_eq!(glob_root(".kiro/steering/roadmap.md"), PathBuf::from(".kiro/steering"));
+    }
+
+    #[test]
+    fn glob_root_with_meta_in_middle() {
+        assert_eq!(glob_root(".kiro/specs/*/brief.md"), PathBuf::from(".kiro/specs"));
+        assert_eq!(glob_root("docs/fr/[0-9]*.md"), PathBuf::from("docs/fr"));
+        assert_eq!(glob_root("crates/*/README.md"), PathBuf::from("crates"));
+    }
+
+    #[test]
+    fn glob_root_no_dir() {
+        assert_eq!(glob_root("*.md"), PathBuf::from("."));
+        assert_eq!(glob_root("README.md"), PathBuf::from(""));
+    }
+
+    #[test]
+    fn glob_root_double_star() {
+        assert_eq!(glob_root("docs/**/*.md"), PathBuf::from("docs"));
+    }
+}
