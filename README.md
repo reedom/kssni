@@ -19,7 +19,7 @@ Binary name: `kssni`.
 
 ## Quick start
 
-1. Drop `docs/kinds.md` (sample shipped in this repo) into your project's doc root.
+1. Copy `docs/kinds.md` from this repo into your project's doc root and edit the kinds list to match your project layout. The shipped file is a working example, not a fixed schema.
 2. Add `refs:` frontmatter to any Markdown file you want tracked. Minimal example:
 
    ```markdown
@@ -52,10 +52,10 @@ Binary name: `kssni`.
 
 ```sh
 kssni validate
-kssni impact <id> [<id>...] [--include-related]
-kssni deps   <id> [<id>...] [--include-related]
+kssni impact <id> [<id>...] [--depth <N>] [--include-related]
+kssni deps   <id> [<id>...] [--depth <N>] [--include-related]
 kssni show   <id>
-kssni touched <file> [<file>...]
+kssni touched <file> [<file>...] [--no-closure]
 kssni list
 kssni index map
 kssni index

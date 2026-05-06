@@ -26,10 +26,14 @@ refs:
   modules:                       # optional, repo-relative source paths or dir prefixes
     - <path>
     - <path-prefix>/             # trailing slash: any file under this directory
+  generated: false               # reserved; auto-generated index files only
+  indexes_kind: <kind>           # reserved; auto-generated per-kind index files only
 ---
 ```
 
 All list fields default to empty.
+
+`generated:` and `indexes_kind:` are written by `kssni index` on generated INDEX files (kind `index`). Do not set them by hand on regular docs.
 
 ## Relation semantics
 
@@ -65,8 +69,8 @@ When a doc enumerates child IDs in `provides:`, downstream docs may reference an
 
 ```yaml
 refs:
-  id: requirements:my-spec
-  kind: requirements
+  id: spec:my-spec
+  kind: spec
   spec: my-spec
   provides:
     - req:my-spec:1
@@ -116,10 +120,10 @@ Naming: only `README.md` is capitalized; all other generated/config files lowerc
 kssni validate
 
 # editor / dev-loop queries
-kssni impact <id> [<id>...] [--include-related]
-kssni deps   <id> [<id>...] [--include-related]
+kssni impact <id> [<id>...] [--depth <N>] [--include-related]
+kssni deps   <id> [<id>...] [--depth <N>] [--include-related]
 kssni show   <id>
-kssni touched <file> [<file>...]
+kssni touched <file> [<file>...] [--no-closure]
 kssni list
 
 # index regeneration (idempotent)
