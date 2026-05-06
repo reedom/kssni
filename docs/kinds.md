@@ -16,11 +16,9 @@ Schema semantics (`implements` / `depends_on` / `related` / `provides` / `module
 # Each entry is a kind definition.
 #   name           — kind identifier used as the `kind:` field in front matter
 #                    and as the prefix in `id:` (e.g., kind=fr → id=fr:01-...).
-#   path_globs     — repo-relative globs the scanner walks. Literal repo paths;
-#                    they are NOT prefixed by KSSNI_DOC_ROOT at runtime, so if
-#                    you move docs out of `docs/`, edit the globs to match.
-#                    Omit entirely for kinds declared only via `provides:` of
-#                    another doc.
+#   path_globs     — repo-relative globs the scanner walks. Literal paths;
+#                    not prefixed by KSSNI_DOC_ROOT. Omit for kinds declared
+#                    only via `provides:` of another doc.
 #   declared_via   — "provides" if this kind never has its own file
 #                    (the IDs are listed in the `provides:` of another doc),
 #                    or "generated" for kinds written only by `kssni index`.
@@ -34,9 +32,9 @@ Schema semantics (`implements` / `depends_on` / `related` / `provides` / `module
 #                    file carries frontmatter (kind=index, generated=true,
 #                    id=index:<name>, indexes_kind=<name>).
 #       output     — repo-relative path to write the INDEX to.
-#       group_by   — optional. Currently the only recognized value is "spec";
-#                    when set, the INDEX body is split into one section per
-#                    `spec:` value.
+#       group_by   — optional. Recognized values: `spec`. When set to
+#                    `spec`, the INDEX body is split into one section
+#                    per `spec:` value.
 kinds:
   - name: roadmap
     path_globs: ["docs/roadmap.md"]
@@ -57,8 +55,9 @@ kinds:
       output: docs/fr/index.md
 
   - name: reference
-    # `[a-z]*` excludes README.md (uppercase) by design; index.md is included
-    # because it carries its own kind: index frontmatter.
+    # Glob `[a-z]*.md` matches lowercase filenames; `README.md` and other
+    # uppercase filenames are not matched. The generated `index.md` is
+    # matched and carries its own `kind: index` frontmatter.
     path_globs: ["docs/reference/[a-z]*.md"]
     id_pattern: "ref:{slug}"
     index:

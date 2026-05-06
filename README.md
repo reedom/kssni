@@ -11,15 +11,13 @@ Cross-reference graph tooling for Markdown specs and docs.
 
 ```sh
 cargo install --path .
-# or, once published:
-# cargo install kssni
 ```
 
 Binary name: `kssni`.
 
 ## Quick start
 
-1. Copy `docs/kinds.md` from this repo into your project's doc root and edit the kinds list to match your project layout. The shipped file is a working example, not a fixed schema.
+1. Copy `docs/kinds.md` from this repo into your project's doc root and edit the kinds list to match your project layout.
 2. Add `refs:` frontmatter to any Markdown file you want tracked. Minimal example:
 
    ```markdown

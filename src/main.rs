@@ -77,10 +77,6 @@ enum IndexTarget {
 // ---------------------------------------------------------------------------
 
 /// Identifier of a doc node in the cross-reference graph.
-///
-/// Distinct type from [`Kind`] so the compiler rejects accidental swaps in
-/// function arguments and map keys. Wraps a `String` for cheap construction
-/// from front-matter input; serializes transparently.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, serde::Serialize)]
 #[serde(transparent)]
 struct DocId(String);
@@ -116,10 +112,7 @@ impl std::borrow::Borrow<str> for DocId {
 }
 
 /// Identifier of a doc kind (the `kind:` field in front matter).
-///
-/// Distinct type from [`DocId`] so a function expecting a kind cannot be
-/// passed a doc id by mistake. The reserved value `"index"` denotes a
-/// generated INDEX doc; see [`Kind::is_index`].
+/// The literal `"index"` denotes a generated INDEX doc.
 #[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Deserialize, serde::Serialize)]
 #[serde(transparent)]
 struct Kind(String);
@@ -127,7 +120,7 @@ struct Kind(String);
 impl Kind {
     const INDEX_LITERAL: &'static str = "index";
 
-    #[allow(dead_code)] // symmetry with DocId::as_str; reserved for future use.
+    #[allow(dead_code)]
     fn as_str(&self) -> &str {
         &self.0
     }
@@ -180,12 +173,14 @@ enum DeclaredVia {
 }
 
 #[derive(Debug, Deserialize, Clone)]
-#[allow(dead_code)] // id_pattern + singleton are documented in kinds.md, surfaced via the manifest model for future use.
+#[allow(dead_code)] // `id_pattern` and `singleton` are informational manifest fields.
 struct KindDef {
     name: Kind,
     #[serde(default)]
     path_globs: Vec<String>,
-    /// `provides` or `generated`; absent means a normal file-backed kind.
+    /// `provides` for kinds declared inside another doc's `provides:`,
+    /// `generated` for kinds written by `kssni index`. Absent for
+    /// hand-authored, file-backed kinds.
     #[serde(default)]
     declared_via: Option<DeclaredVia>,
     #[serde(default)]
@@ -238,8 +233,8 @@ impl Manifest {
     }
 }
 
+/// Returns the body of the first ```yaml or ```yml fenced block in `content`.
 fn extract_fenced_yaml(content: &str) -> Option<&str> {
-    // Look for the first ```yaml fenced block.
     let mut byte_start: Option<usize> = None;
     let mut byte_end: Option<usize> = None;
     let mut cursor: usize = 0;
@@ -308,16 +303,11 @@ struct Doc {
 }
 
 /// Classifies a doc as either user-authored or `kssni`-generated.
-///
-/// The variants are mutually exclusive and capture the wire-format
-/// invariant `kind == "index" iff generated && indexes_kind.is_some()
-/// implies kind == "index"` so the impossible combinations are
-/// unrepresentable.
 #[derive(Debug, Clone)]
 enum DocClass {
-    /// Regular hand-authored doc with the given kind. Never `"index"`.
+    /// Hand-authored doc with the given kind. The kind is never `"index"`.
     Regular(Kind),
-    /// Generated INDEX doc (`kind: index`, `generated: true`).
+    /// Generated INDEX doc with `kind: index` and `generated: true`.
     Index(IndexFlavor),
 }
 
@@ -517,8 +507,6 @@ fn build_graph(
                 ));
                 continue;
             }
-            // Resolve the wire-format flags into one DocClass; reject any
-            // combination that would map to an unrepresentable variant.
             let class = match (
                 refs_block.kind.is_index(),
                 refs_block.generated,
@@ -568,8 +556,6 @@ fn build_graph(
                 ));
                 continue;
             }
-            // Collect provides without overwriting prior owners; first writer wins
-            // so traversal stays deterministic relative to the reported error.
             let mut conflict = false;
             for pid in &doc.provides {
                 if let Some(owner) = id_to_doc.get(pid) {
@@ -608,9 +594,8 @@ fn build_graph(
     ))
 }
 
-/// Derive scan roots from the kind manifest by stripping each `path_glob` down
-/// to its longest non-glob prefix (the dir we walk). The configured doc root is
-/// always included as a root so the global `map.md` can be discovered as a node.
+/// Returns the directories to walk: each `path_glob` reduced to its longest
+/// non-glob prefix, plus `doc_root`.
 fn derive_scan_roots(manifest: &Manifest, doc_root: &Path) -> BTreeSet<PathBuf> {
     let mut roots: BTreeSet<PathBuf> = BTreeSet::new();
     roots.insert(doc_root.to_path_buf());
@@ -721,8 +706,7 @@ fn cmd_validate(
         }
     }
 
-    // Strict glob coverage: any file matching a kind's `path_globs` MUST appear
-    // in the graph (i.e., have a `refs:` block declaring some kind).
+    // Every file matched by a kind's `path_globs` must have a `refs:` block.
     let in_graph: BTreeSet<PathBuf> = graph
         .docs
         .values()
@@ -993,9 +977,8 @@ fn module_covers(pattern: &str, file: &str) -> bool {
     }
 }
 
-/// Normalize platform path separators to forward slashes so `module_covers`
-/// can match consistently across Windows and Unix. Inputs already using `/`
-/// are unchanged.
+/// Replaces every `\` with `/` so `module_covers` compares paths in a single
+/// canonical form.
 fn normalize_separators(s: &str) -> String {
     if s.contains('\\') {
         s.replace('\\', "/")
@@ -1086,12 +1069,13 @@ fn write_map(root: &Path, doc_root: &Path, graph: &Graph) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Returns `rel_path` rewritten relative to `doc_root` (where `map.md` lives).
+/// Paths under `doc_root` are stripped of that prefix; paths outside it are
+/// prefixed with one `../` per `doc_root` component.
 fn doc_link(doc_root: &Path, rel_path: &Path) -> String {
-    // map.md lives under doc_root, so links to docs at doc_root/foo become "foo".
     if let Ok(stripped) = rel_path.strip_prefix(doc_root) {
         return stripped.display().to_string();
     }
-    // Otherwise emit a path that goes up out of doc_root.
     let depth = doc_root.components().count();
     let mut up = String::new();
     for _ in 0..depth {

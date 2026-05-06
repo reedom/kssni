@@ -26,8 +26,8 @@ refs:
   modules:                       # optional, repo-relative source paths or dir prefixes
     - <path>
     - <path-prefix>/             # trailing slash: any file under this directory
-  generated: false               # reserved; auto-generated index files only
-  indexes_kind: <kind>           # reserved; auto-generated per-kind index files only
+  generated: false               # set by `kssni index` on generated INDEX files
+  indexes_kind: <kind>           # set by `kssni index` on per-kind INDEX files
 ---
 ```
 
@@ -131,7 +131,7 @@ kssni index map     # global map.md + ai/graph.json + ai/modules.md
 kssni index         # all per-kind index.md files
 ```
 
-## Out of scope (deliberately)
+## Out of scope
 
 - Validator does not check prose `Traceability` agreement with front matter — humans audit.
 - Validator does not parse headings; `provides:` is the source of truth.
