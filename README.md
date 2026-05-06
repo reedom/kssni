@@ -37,13 +37,13 @@ Binary name: `kssni`.
 3. Run:
 
    ```sh
-   kssni validate            # CI gate
-   kssni list                # every known ID
+   kssni validate
+   kssni list
    kssni show ref:auth-overview
    kssni impact ref:auth-overview
    kssni touched src/auth/session.rs
-   kssni index map           # write map.md + ai/graph.json + ai/modules.md
-   kssni index               # write per-kind index.md files
+   kssni index map           # writes map.md + ai/graph.json + ai/modules.md
+   kssni index               # writes per-kind index.md files
    ```
 
 ## Subcommands

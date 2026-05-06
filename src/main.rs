@@ -53,9 +53,9 @@ enum Cmd {
         #[arg(long)]
         no_closure: bool,
     },
-    /// Regenerate index files. Two targets:
-    ///   `map`  — global map.md + ai/graph.json + ai/modules.md
-    ///   (no arg / `kind`) — every kind whose manifest entry has `index.output`
+    /// Regenerate index files. Targets:
+    ///   `map` — global map.md + ai/graph.json + ai/modules.md
+    ///   `all` (default) — every kind whose manifest entry has `index.output`
     Index {
         #[arg(value_enum, default_value_t = IndexTarget::All)]
         target: IndexTarget,
@@ -977,8 +977,7 @@ fn module_covers(pattern: &str, file: &str) -> bool {
     }
 }
 
-/// Replaces every `\` with `/` so `module_covers` compares paths in a single
-/// canonical form.
+/// Replaces every `\` with `/`.
 fn normalize_separators(s: &str) -> String {
     if s.contains('\\') {
         s.replace('\\', "/")

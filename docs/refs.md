@@ -45,7 +45,7 @@ All list fields default to empty.
 | `provides` | "I declare these additional IDs inside my body." | self → child IDs | hard |
 | `modules` | "I am the design of record for these source paths." | doc → code | hard |
 
-Forward graph (`implements` + `depends_on`) is what `kssni impact` traverses to answer "if I change X, what else needs review?". `related` is informational only by default; pass `--include-related` to fold it into the traversal.
+`kssni impact` traverses the forward graph (`implements` + `depends_on`). `related` is informational by default; `--include-related` includes it in the traversal.
 
 ## ID grammar
 
@@ -116,19 +116,14 @@ Naming: only `README.md` is capitalized; all other generated/config files lowerc
 ## Tooling reference
 
 ```sh
-# graph integrity (CI gate)
 kssni validate
-
-# editor / dev-loop queries
 kssni impact <id> [<id>...] [--depth <N>] [--include-related]
 kssni deps   <id> [<id>...] [--depth <N>] [--include-related]
 kssni show   <id>
 kssni touched <file> [<file>...] [--no-closure]
 kssni list
-
-# index regeneration (idempotent)
-kssni index map     # global map.md + ai/graph.json + ai/modules.md
-kssni index         # all per-kind index.md files
+kssni index map     # writes map.md + ai/graph.json + ai/modules.md
+kssni index         # writes per-kind index.md files
 ```
 
 ## Out of scope
@@ -137,4 +132,4 @@ kssni index         # all per-kind index.md files
 - Validator does not parse headings; `provides:` is the source of truth.
 - `id_pattern` in `kinds.md` is documentation, not enforcement; uniqueness is the only ID check.
 - No glob expansion in `modules:` — literal paths and directory prefixes only.
-- No automatic doc-to-doc propagation — schema is for findability, not generation.
+- No automatic doc-to-doc propagation.
