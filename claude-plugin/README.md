@@ -2,7 +2,7 @@
 
 Document-management workflows for [kusara](../README.md), packaged as a Claude Code plugin.
 
-The plugin lives inside the kusara repo so anyone cloning gets it auto-discovered when they open the repo with Claude Code. The repo also ships a `marketplace.json` so users can install via Claude Code's marketplace mechanism without cloning.
+The plugin lives inside the kusara repo and is distributed via the repo's `.claude-plugin/marketplace.json`. Users install through the Claude Code marketplace mechanism; developers hacking on kusara itself can load it directly with `--plugin-dir`.
 
 ## Install
 
@@ -19,7 +19,8 @@ Pick one:
 
 ```sh
 git clone https://github.com/reedom/kusara
-# then open the cloned directory in Claude Code — the plugin auto-discovers.
+cd kusara
+claude --plugin-dir ./claude-plugin
 ```
 
 ## What's inside
@@ -68,7 +69,8 @@ Use `/kusara:check` between rounds for a read-only health pulse.
 .claude-plugin/
   marketplace.json    ← marketplace listing (single-plugin repo)
 claude-plugin/
-  plugin.json         ← plugin manifest
+  .claude-plugin/
+    plugin.json       ← plugin manifest
   README.md           ← you are here
   commands/
     setup.md
