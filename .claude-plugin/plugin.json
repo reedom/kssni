@@ -1,12 +1,12 @@
 {
-  "name": "kssni",
+  "name": "kusara",
   "version": "0.1.0",
-  "description": "Document-management workflows for kssni: validate, audit, and auto-maintain related Markdown docs after changes.",
+  "description": "Document-management workflows for kusara: validate, audit, and auto-maintain related Markdown docs after changes.",
   "author": {
     "name": "HANAI Tohru",
     "email": "tohru@reedom.com"
   },
-  "homepage": "https://github.com/reedom/kssni",
+  "homepage": "https://github.com/reedom/kusara",
   "license": "MIT",
-  "keywords": ["kssni", "documentation", "markdown", "cross-reference", "frontmatter"]
+  "keywords": ["kusara", "documentation", "markdown", "cross-reference", "frontmatter"]
 }
